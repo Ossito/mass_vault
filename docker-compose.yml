@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  mass-vault:
+    build: .
+    image: mass-vault:latest
+    container_name: mass-vault-app
+    environment:
+      - DISPLAY=host.docker.internal:0
+      - STORAGE_PATH=/app/vault_data
+      - APP_THEME=flatly
+      - APP_LANG=fr
+    volumes:
+      - .:/app
+      - /Users/germainh.:/Users/germainh.
+    restart: "no"

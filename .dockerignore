@@ -1,0 +1,14 @@
+.venv
+.git
+.DS_Store
+__pycache__
+*.pyc
+vault_data
+performance_results
+app/vault_data
+Dockerfile
+docker-compose.yml
+mass_vault.sh
+lancer_mass_vault.command
+outputs
+logs
