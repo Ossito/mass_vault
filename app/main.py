@@ -1,5 +1,5 @@
 import tkinter as tk
-import ttkbootstrap as ttk
+import ttkbootstrap as ttk # type: ignore
 from interfaces.home_window import HomeWindow
 
 # Variables globales pour le centrage automatique
@@ -9,7 +9,7 @@ _last_height = None
 # Décalage pour compenser le Dock (à ajuster selon votre écran, 60–80 pixels généralement)
 DOCK_OFFSET = 70
 
-def center_window(window, width=None, height=None, y_offset=DOCK_OFFSET):
+def center_window(window, width=None, height=None, y_offset=DOCK_OFFSET):   
     """
     Centre la fenêtre en tenant compte d'un décalage vertical (pour le Dock).
     Si width/height sont fournis, redimensionne d'abord.
