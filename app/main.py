@@ -1,3 +1,5 @@
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 import tkinter as tk
 import ttkbootstrap as ttk # type: ignore
 from interfaces.home_window import HomeWindow
