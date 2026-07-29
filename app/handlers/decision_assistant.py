@@ -5,6 +5,7 @@ from pathlib import Path
 from fpdf import FPDF
 from utils.storage import storage_manager
 
+
 # ----------------------------------------------------------------------
 # 1. Chargement des métriques
 # ----------------------------------------------------------------------
@@ -30,14 +31,11 @@ def load_all_metrics(storage_manager):
             pass
     return data
 
+
 # ----------------------------------------------------------------------
 # 2. Extraction des performances moyennes par groupe
 # ----------------------------------------------------------------------
 def extract_performance(metrics_list):
-    """
-    Calcule les indicateurs moyens et, si disponible, une régression linéaire
-    (temps = a * taille + b) à partir des données de calibration.
-    """
     nb_files_avg = np.mean([m['files_processed'] for m in metrics_list])
     key_gen = np.mean([m['timings'].get('key_generation', 0) for m in metrics_list])
     signing = np.mean([m['timings'].get('signature', 0) for m in metrics_list])
@@ -47,7 +45,7 @@ def extract_performance(metrics_list):
     ram_max = np.max([m['resources'].get('ram_max', 0) for m in metrics_list])
     overhead = np.mean([m.get('overhead', 0) for m in metrics_list])
 
-    # --- Régression linéaire à partir des données de calibration ---
+    # Données de calibration pour régression
     all_sizes = []
     all_times = []
     for m in metrics_list:
@@ -57,11 +55,11 @@ def extract_performance(metrics_list):
             all_times.extend(cal['encryption_times_sec'])
 
     if len(all_sizes) >= 3:
-        coeffs = np.polyfit(all_sizes, all_times, 1)  # [a, b] : temps = a * taille + b
-        slope = coeffs[0]      # secondes par octet
-        intercept = coeffs[1]  # secondes (overhead fixe par fichier)
+        coeffs = np.polyfit(all_sizes, all_times, 1)   # [pente, intercept]
+        slope = coeffs[0]
+        intercept = coeffs[1]
     else:
-        # Fallback sur l'ancienne méthode (débit global)
+        # Fallback débit global
         total_size = np.mean([m.get('total_size', 0) for m in metrics_list])
         encryption = np.mean([m['timings'].get('encapsulation', 0) for m in metrics_list])
         if total_size and encryption and nb_files_avg:
@@ -85,11 +83,12 @@ def extract_performance(metrics_list):
         'avg_file_count': nb_files_avg
     }
 
+
 # ----------------------------------------------------------------------
 # 3. Prédiction pour un scénario donné
 # ----------------------------------------------------------------------
 def predict_performance(perf, volume_gb, nb_files):
-    volume_bytes = volume_gb * 1024**3
+    volume_bytes = volume_gb * 1024 ** 3
     avg_file_size = volume_bytes / nb_files if nb_files else 0
 
     # Temps de chiffrement AES‑CTR par fichier (inclut l'overhead fixe)
@@ -100,8 +99,9 @@ def predict_performance(perf, volume_gb, nb_files):
     total_sign = encrypt_time + perf['signing'] * nb_files
     total_verify = perf['verification'] * nb_files
 
-    # Déchiffrement AES‑CTR (pas d'overhead fixe car c'est la même opération)
-    decrypt_aes_time = nb_files * (perf['slope'] * avg_file_size)  # même débit
+    # Déchiffrement AES‑CTR – même modèle (overhead fixe existe aussi)
+    decrypt_time_per_file = perf['slope'] * avg_file_size + perf['intercept']
+    decrypt_aes_time = nb_files * decrypt_time_per_file
     total_decrypt = decrypt_aes_time + perf['decryption'] * nb_files
 
     return {
@@ -111,136 +111,167 @@ def predict_performance(perf, volume_gb, nb_files):
         'dechiffrement': total_decrypt,
         'ram_max': perf['ram_max'],
         'overhead': perf['overhead']
-    }  
+    }
+
 
 # ----------------------------------------------------------------------
-# 4. Logique de recommandation
+# 4. Logique de recommandation (complète et dynamique)
 # ----------------------------------------------------------------------
 def recommend(constraints, predictions):
     """
-    constraints : dict avec ram_gb, cpu_ghz, storage_gb, retention_years, access_freq
-    predictions : dict { algo_label: prediction_dict }
-    Retourne le label recommandé et une justification.
+    Règles métier strictes :
+    - ECC si RAM < 6 Go OU accès régulier/fréquent.
+    - RSA si RAM >= 6 Go ET accès rare.
+    - Si aucun ECC ou RSA n'est disponible, prendre le premier algorithme.
     """
-    # Règles
-    best_label = None
-    reasons = []
-    # Si RAM très limitée (<4 Go) et CPU modeste, ECC
-    if constraints['ram_gb'] < 4 and constraints['cpu_ghz'] < 4:
-        for label in predictions:
-            if 'ECC' in label:
-                best_label = label
-                reasons.append("RAM et CPU limités → ECC recommandé")
-                break
-    # Si durée de conservation > 5 ans, RSA
-    if constraints['retention_years'] > 5:
-        for label in predictions:
-            if 'RSA' in label:
-                best_label = label
-                reasons.append("Conservation longue durée → RSA recommandé")
-                break
-    # Si accès fréquent, ECC (déchiffrement plus rapide)
-    if constraints['access_freq'] == 'frequent':
-        for label in predictions:
-            if 'ECC' in label:
-                best_label = label
-                reasons.append("Accès fréquent → ECC (déchiffrement rapide)")
-                break
-    # Si stockage limité, ECC (overhead faible)
-    if constraints['storage_gb'] < 2 * constraints['volume_gb']:
-        for label in predictions:
-            if 'ECC' in label:
-                best_label = label
-                reasons.append("Stockage très limité → ECC (overhead minimal)")
-                break
-    # Par défaut, prendre le meilleur compromis (ECC)
-    if not best_label:
-        for label in predictions:
-            if 'ECC' in label:
-                best_label = label
-                reasons.append("Compromis général → ECC recommandé")
-                break
-    # Si aucun ECC, prendre le premier
-    if not best_label:
-        best_label = list(predictions.keys())[0]
-        reasons.append("Aucun ECC disponible, choix par défaut")
-    return best_label, reasons
+    ram_gb = constraints.get('ram_gb', 8)
+    access_freq = constraints.get('access_freq', 'rare')
+
+    # Identifier les meilleurs candidats ECC et RSA (par performance brute)
+    ecc_labels = [lbl for lbl in predictions if lbl.startswith('ECC')]
+    rsa_labels = [lbl for lbl in predictions if lbl.startswith('RSA')]
+
+    def best_of(labels):
+        if not labels:
+            return None
+        return min(labels, key=lambda l: predictions[l]['chiffrement'] + predictions[l]['dechiffrement'])
+
+    best_ecc = best_of(ecc_labels)
+    best_rsa = best_of(rsa_labels)
+
+    # Appliquer les règles
+    if ram_gb < 6 or access_freq in ('régulier', 'frequent'):
+        # ECC prioritaire
+        if best_ecc:
+            label = best_ecc
+            reasons = [
+                "ECC est recommandé pour les environnements avec ressources limitées (RAM < 6 Go) ou accès régulier/fréquent.",
+                "ECC offre de meilleures performances et une empreinte mémoire réduite."
+            ]
+        elif best_rsa:
+            label = best_rsa
+            reasons = ["ECC non disponible, RSA est le seul choix."]
+        else:
+            label = list(predictions.keys())[0]
+            reasons = ["Aucun algorithme ECC ou RSA trouvé, choix par défaut."]
+    else:
+        # RAM >= 6 Go et accès rare → RSA
+        if best_rsa:
+            label = best_rsa
+            reasons = [
+                "Avec une RAM suffisante (>= 6 Go) et un accès rare, RSA est recommandé.",
+                "RSA offre une sécurité éprouvée et une bonne stabilité."
+            ]
+        elif best_ecc:
+            label = best_ecc
+            reasons = ["RSA non disponible, ECC est le seul choix."]
+        else:
+            label = list(predictions.keys())[0]
+            reasons = ["Aucun algorithme RSA ou ECC trouvé, choix par défaut."]
+
+    # Ajouter des informations sur le candidat retenu
+    pred = predictions[label]
+    reasons += [
+        f"Chiffrement estimé : {pred['chiffrement']:.1f} s",
+        f"Déchiffrement estimé : {pred['dechiffrement']:.1f} s",
+        f"RAM maximale estimée : {pred['ram_max']:.0f} Mo",
+        f"Overhead de stockage : {pred['overhead']:.2f} %"
+    ]
+
+    return label, reasons
+
 
 # ----------------------------------------------------------------------
-# 5. Génération du rapport PDF
+# 5. Génération du rapport PDF (sans erreurs de police)
 # ----------------------------------------------------------------------
 def generate_decision_report(constraints, predictions, recommendation, reasons, output_dir):
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     report_dir = Path(output_dir) / f"decision_{timestamp}"
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---------- Classe PDF avec support Unicode ----------
     class PDF(FPDF):
         def __init__(self):
             super().__init__()
-            self.font_dir = Path(__file__).parent.parent / "fonts"  # dossier fonts à la racine
+            self.font_dir = Path(__file__).parent.parent / "fonts"
             self.unicode_font = None
             self.setup_fonts()
 
         def setup_fonts(self):
-            # Essaie d’ajouter une police Unicode
             for font_name, file_name in [('DejaVu', 'DejaVuSans.ttf'),
                                          ('DejaVu', 'DejaVuSansCondensed.ttf')]:
                 font_path = self.font_dir / file_name
                 if font_path.exists():
                     try:
-                        self.add_font(font_name, '', str(font_path), uni=True)
+                        self.add_font(font_name, '', str(font_path), uni=True) # type: ignore
                         self.unicode_font = font_name
                         return
                     except:
                         pass
-            # Fallback : on utilisera helvetica et on remplacera les caractères Unicode
 
-        def write_text(self, txt):
+        def safe_text(self, txt):
+            """Remplace tous les caractères Unicode problématiques par des équivalents ASCII."""
             if self.unicode_font:
-                self.set_font(self.unicode_font, '', 12)
-                self.cell(0, 6, txt, ln=1)
-            else:
-                self.set_font("helvetica", '', 12)
-                safe = txt.replace('→', '->').replace('•', '-')
-                self.cell(0, 6, safe, ln=1)
+                return txt
+            replacements = {
+                '–': '-', '—': '-', '’': "'", '‘': "'",
+                '“': '"', '”': '"', '…': '...', '•': '-', '→': '->',
+                '≤': '<=', '≥': '>=', '±': '+/-'
+            }
+            for orig, repl in replacements.items():
+                txt = txt.replace(orig, repl)
+            return txt
 
-        def write_title(self, txt, size=16):
-            if self.unicode_font:
-                self.set_font(self.unicode_font, 'B', size)
-            else:
-                self.set_font("helvetica", 'B', size)
-            self.cell(0, 10, txt, ln=1, align="C")
-
-    # ----------------------------------------------------------------
     pdf = PDF()
     pdf.add_page()
-    pdf.write_title("RAPPORT DE DÉCISION CRYPTOGRAPHIQUE", 16)
+
+    # Titre
+    if pdf.unicode_font:
+        pdf.set_font(pdf.unicode_font, 'B', 16)
+    else:
+        pdf.set_font("helvetica", 'B', 16)
+    pdf.cell(0, 10, pdf.safe_text("RAPPORT DE DÉCISION CRYPTOGRAPHIQUE"), ln=1, align="C") # type: ignore
     pdf.ln(10)
-    pdf.set_font("helvetica", '', 12)
-    pdf.cell(0, 6, f"Généré le {datetime.datetime.now().strftime('%d/%m/%Y à %H:%M:%S')}", ln=1, align="C")
+
+    # Date
+    if pdf.unicode_font:
+        pdf.set_font(pdf.unicode_font, '', 12)
+    else:
+        pdf.set_font("helvetica", '', 12)
+    pdf.cell(0, 6, pdf.safe_text(f"Généré le {datetime.datetime.now().strftime('%d/%m/%Y à %H:%M:%S')}"), ln=1, align="C") # type: ignore
     pdf.ln(10)
 
     # Contraintes
-    pdf.set_font("helvetica", 'B', 14)
-    pdf.cell(0, 8, "CONTRAINTES UTILISATEUR", ln=1)
-    pdf.set_font("helvetica", '', 12)
+    if pdf.unicode_font:
+        pdf.set_font(pdf.unicode_font, 'B', 14)
+    else:
+        pdf.set_font("helvetica", 'B', 14)
+    pdf.cell(0, 8, "CONTRAINTES UTILISATEUR", ln=1) # type: ignore
+    if pdf.unicode_font:
+        pdf.set_font(pdf.unicode_font, '', 12)
+    else:
+        pdf.set_font("helvetica", '', 12)
     for k, v in constraints.items():
-        pdf.cell(0, 6, f"- {k} : {v}", ln=1)
+        pdf.cell(0, 6, pdf.safe_text(f"- {k} : {v}"), ln=1) # type: ignore
     pdf.ln(10)
 
     # Tableau des prédictions
-    pdf.set_font("helvetica", 'B', 14)
-    pdf.cell(0, 8, "PRÉDICTIONS", ln=1)
+    if pdf.unicode_font:
+        pdf.set_font(pdf.unicode_font, 'B', 14)
+    else:
+        pdf.set_font("helvetica", 'B', 14)
+    pdf.cell(0, 8, "PRÉDICTIONS", ln=1) # type: ignore
     pdf.ln(5)
-    # En-têtes
-    pdf.set_font("helvetica", 'B', 10)
+
+    if pdf.unicode_font:
+        pdf.set_font(pdf.unicode_font, 'B', 10)
+    else:
+        pdf.set_font("helvetica", 'B', 10)
     cols = ["Critère"] + list(predictions.keys())
     col_widths = [40] + [30] * len(predictions)
     for i, col in enumerate(cols):
         pdf.cell(col_widths[i], 7, col, border=1, align='C')
     pdf.ln()
-    # Lignes
+
     metrics = [
         ("Chiffrement (s)", 'chiffrement'),
         ("Signature (s)", 'signature'),
@@ -249,7 +280,10 @@ def generate_decision_report(constraints, predictions, recommendation, reasons, 
         ("RAM max (Mo)", 'ram_max'),
         ("Overhead (%)", 'overhead'),
     ]
-    pdf.set_font("helvetica", '', 10)
+    if pdf.unicode_font:
+        pdf.set_font(pdf.unicode_font, '', 10)
+    else:
+        pdf.set_font("helvetica", '', 10)
     for label, key in metrics:
         pdf.cell(col_widths[0], 7, label, border=1)
         for algo in predictions:
@@ -262,18 +296,30 @@ def generate_decision_report(constraints, predictions, recommendation, reasons, 
     pdf.ln(10)
 
     # Recommandation
-    pdf.set_font("helvetica", 'B', 14)
-    pdf.cell(0, 8, "RECOMMANDATION", ln=1)
-    pdf.set_font("helvetica", '', 12)
-    pdf.cell(0, 6, f"Algorithme recommandé : {recommendation}", ln=1)
+    if pdf.unicode_font:
+        pdf.set_font(pdf.unicode_font, 'B', 14)
+    else:
+        pdf.set_font("helvetica", 'B', 14)
+    pdf.cell(0, 8, "RECOMMANDATION", ln=1) # type: ignore
+    if pdf.unicode_font:
+        pdf.set_font(pdf.unicode_font, '', 12)
+    else:
+        pdf.set_font("helvetica", '', 12)
+    pdf.cell(0, 6, pdf.safe_text(f"Algorithme recommandé : {recommendation}"), ln=1) # type: ignore
     pdf.ln(5)
-    pdf.set_font("helvetica", 'B', 12)
-    pdf.cell(0, 6, "Justification :", ln=1)
-    pdf.set_font("helvetica", '', 12)
+
+    if pdf.unicode_font:
+        pdf.set_font(pdf.unicode_font, 'B', 12)
+    else:
+        pdf.set_font("helvetica", 'B', 12)
+    pdf.cell(0, 6, "Justification :", ln=1) # type: ignore
+    if pdf.unicode_font:
+        pdf.set_font(pdf.unicode_font, '', 12)
+    else:
+        pdf.set_font("helvetica", '', 12)
     for r in reasons:
-        # Remplacer les flèches si la police Unicode n'est pas disponible
-        safe_r = r if pdf.unicode_font else r.replace('→', '->')
-        pdf.cell(0, 6, f"- {safe_r}", ln=1)
+        safe_r = r if pdf.unicode_font else r.replace('→', '->').replace('–', '-')
+        pdf.cell(0, 6, f"- {safe_r}", ln=1) # type: ignore
 
     pdf.output(str(report_dir / "rapport_decision.pdf"))
     return str(report_dir)
